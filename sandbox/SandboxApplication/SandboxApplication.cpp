@@ -16,14 +16,72 @@
 
 using functor_storage = fixed_size_function<void(), 128, construct_type::move>;
 
+template<typename T>
+struct functor_dispatcher;
+
+template<typename F>
+inline auto create_task(F&& functor);
+
+template<typename F, typename T>
+inline auto create_task(F&& functor, std::shared_future<T> parentFuture);
+
 template<typename TResult>
-struct task {
+class task {
+    friend struct functor_dispatcher<TResult>;
+    friend class thread_impl;
+    friend class thread_pool;
+
+public:
+    void wait() const {
+        future.wait();
+    }
+
+    TResult get() {
+        return future.get();
+    }
+
+    template<typename F>
+    task<typename std::invoke_result_t<F, TResult>> continue_with(F&& func) {
+        auto continuosTask = create_task(std::forward<F>(func), future);
+        continuos.push_back(continuosTask.functor);
+        return continuosTask;
+    }
+
+private:
     task(std::shared_ptr<functor_storage>&& fn, std::future<TResult>&& ft) :
         functor(std::forward<std::shared_ptr<functor_storage>>(fn)),
         future(std::forward<std::future<TResult>>(ft)) {}
 
     std::shared_ptr<functor_storage> functor;
     std::shared_future<TResult> future;
+    std::vector<functor_storage> continuos;
+};
+
+template<>
+class task<void> {
+    friend struct functor_dispatcher<void>;
+    friend class thread_impl;
+    friend class thread_pool;
+
+public:
+    void wait() const {
+        future.wait();
+    }
+
+    template<typename F>
+    task<typename std::invoke_result_t<F>> continue_with(F&& func) {
+        auto continuosTask = create_task(std::forward<F>(func));
+        continuos.push_back(continuosTask.functor);
+        return continuosTask;
+    }
+
+private:
+    task(std::shared_ptr<functor_storage>&& fn, std::future<void>&& ft) :
+        functor(std::forward<std::shared_ptr<functor_storage>>(fn)),
+        future(std::forward<std::future<void>>(ft)) {}
+
+    std::shared_ptr<functor_storage> functor;
+    std::shared_future<void> future;
 };
 
 template<typename TResult>
@@ -33,6 +91,16 @@ struct functor_dispatcher {
         std::promise<TResult> promise;
         return task<TResult>(std::make_shared<functor_storage>([f = std::move(functor), p = std::move(promise)]() mutable {
             auto result = f();
+            p.set_value(result);
+        }), std::move(promise.get_future()));
+    }
+
+    template<typename F, typename TParent>
+    static task<TResult> create_task(F&& functor, std::shared_future<TParent> future) {
+        std::promise<TResult> promise;
+        return task<TResult>(std::make_shared<functor_storage>([parent = std::move(future), f = std::move(functor), p = std::move(promise)]() mutable {
+            auto parentResult = parent.get();
+            auto result = f(parentResult);
             p.set_value(result);
         }), std::move(promise.get_future()));
     }
@@ -48,11 +116,27 @@ struct functor_dispatcher<void> {
             p.set_value();
         }), std::move(promise.get_future()));
     }
+
+    template<typename F, typename TParent>
+    static task<void> create_task(F&& functor, std::shared_future<TParent> future) {
+        std::promise<void> promise;
+        return task<void>(std::make_shared<functor_storage>([parent = std::move(future), f = std::move(functor), p = std::move(promise)]() mutable {
+            auto parentResult = parent.get();
+            f(parentResult);
+            p.set_value();
+        }), std::move(promise.get_future()));
+    }
 };
 
 template<typename F>
 inline auto create_task(F&& functor) {
     return functor_dispatcher<typename std::invoke_result_t<F>>::create_task(std::forward<F>(functor));
+}
+
+template<typename F, typename T>
+inline auto create_task(F&& functor, std::shared_future<T> parentFuture)
+{
+    return functor_dispatcher<typename std::invoke_result_t<F, T>>::create_task(std::forward<F>(functor), parentFuture);
 }
 
 class thread_impl {
@@ -191,7 +275,12 @@ int main()
 
     pool.AddTask(task1);
     pool.AddTask(task2);
-    task1.future.wait();
-    auto result = task2.future.get();
+    task1.wait();
+    task1.continue_with([]() {});
+    task1.continue_with([]() { return 52; });
+    task2.continue_with([](auto result) { return 63; });
+    task2.continue_with([](auto result) {});
+    auto result = task2.get();
     std::cout << result << std::endl;
 }
+
